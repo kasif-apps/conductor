@@ -4,6 +4,9 @@ import {
 } from "https://deno.land/x/websocket@v0.1.4/mod.ts";
 import { create, verify } from "https://deno.land/x/djwt@v2.8/mod.ts";
 import { join } from "https://deno.land/std@0.183.0/path/mod.ts";
+import { getAvailablePort } from "https://deno.land/x/port@1.0.0/mod.ts";
+
+const port = await getAvailablePort() as number;
 
 const packages: Map<
   string,
@@ -84,9 +87,6 @@ class Server extends EventTarget {
 
   handleMessage(data: string, client: WebSocketClient) {
     const message: ServerMessage = JSON.parse(data);
-    this.generateToken({ name: 'quick-notes', version: '0.0.1' }).then(token => {
-      console.log(token, message.token, token === message.token)
-    })
 
     verify(message.token, this.key)
       .then(async (payload) => {
@@ -129,10 +129,21 @@ class Server extends EventTarget {
 
     if (p) {
       if (p[action.name]) {
-        return {
-          error: null,
-          message: await p[action.name].call(globalThis, action.arguments),
-        };
+        try {
+          const result = await p[action.name].call(
+            globalThis,
+            action.arguments
+          );
+          return {
+            error: null,
+            message: result,
+          };
+        } catch (error) {
+          return {
+            error: String(error),
+            message: "runtime error",
+          };
+        }
       } else {
         return {
           error: `no function named ${action.name} in ${name}`,
@@ -189,7 +200,7 @@ class Server extends EventTarget {
     });
   }
 }
-const server = new Server(8000);
+const server = new Server(port);
 
 server.addEventListener("ready", async () => {
   const tokens: Record<string, string> = {};
@@ -200,8 +211,8 @@ server.addEventListener("ready", async () => {
     });
   }
   const encoder = new TextEncoder();
-  const content = encoder.encode(JSON.stringify(tokens));
-  await Deno.writeFile(join(rootPath, "remote", "tokens.json"), content);
+  const content = encoder.encode(JSON.stringify({ tokens, port }));
+  await Deno.writeFile(join(rootPath, "remote", "stdout.json"), content);
 
   server.serve();
 });
