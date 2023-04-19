@@ -3,45 +3,28 @@ import {
   WebSocketServer,
 } from "https://deno.land/x/websocket@v0.1.4/mod.ts";
 import { create, verify } from "https://deno.land/x/djwt@v2.8/mod.ts";
-import { join } from "https://deno.land/std@0.183.0/path/mod.ts";
+import {
+  join,
+  resolve,
+  fromFileUrl,
+  dirname,
+} from "https://deno.land/std@0.183.0/path/mod.ts";
 import { getAvailablePort } from "https://deno.land/x/port@1.0.0/mod.ts";
 
-const port = await getAvailablePort() as number;
+const port = Deno.args[1]
+  ? parseInt(Deno.args[1])
+  : ((await getAvailablePort()) as number);
 
-const packages: Map<
-  string,
-  // deno-lint-ignore no-explicit-any
-  Record<string, (...args: any[]) => Promise<any> | any>
-> = new Map();
-
-const rootPath = Deno.args[0];
-const root = Deno.readDir(join(rootPath, "apps"));
-
-for await (const plugin of root) {
-  if (plugin.isDirectory) {
-    const manifest = await readManifest(
-      join(rootPath, "apps", plugin.name, "package.json")
-    );
-    const { backend } = manifest.kasif;
-
-    const scriptPath = join(
-      rootPath,
-      "apps",
-      plugin.name,
-      backend.dir,
-      `${backend.entry}.ts`
-    );
-    const mod = await import(scriptPath);
-    packages.set(manifest.kasif.identifier, mod);
-  }
+function getModuleDir(importMeta: ImportMeta): string {
+  return resolve(dirname(fromFileUrl(importMeta.url)));
 }
 
-async function readManifest(path: string) {
-  const raw = await Deno.readFile(path);
-  const decoder = new TextDecoder();
-  const content = decoder.decode(raw);
-  const parsed = JSON.parse(content);
-  return parsed;
+const rootPath = Deno.args[0];
+
+interface TokenPayload {
+  version: string;
+  name: string;
+  error: boolean;
 }
 
 interface ServerMessage {
@@ -49,23 +32,68 @@ interface ServerMessage {
   action: ServerAction;
 }
 
-type ServerAction = ServerCallAction | ServerRetrieveAction;
+type ServerAction =
+  | CallAction
+  | RetrieveAction
+  | ConnectAction
+  | ResponseAction;
 
-interface ServerCallAction {
+interface CallAction {
   id: string;
   type: "call";
   name: string;
-  // deno-lint-ignore no-explicit-any
-  arguments: any[];
+  arguments: unknown[];
 }
 
-interface ServerRetrieveAction {
+interface RetrieveAction {
   id: string;
   type: "retrieve";
   name: string;
 }
 
-interface ServerResponse {
+interface ConnectAction {
+  id: string;
+  name: string;
+  type: "connect";
+}
+
+interface ResponseAction {
+  id: string;
+  type: "response";
+  error: string | null;
+  message: string;
+}
+
+type ServerResponse =
+  | CallResponse
+  | RetrieveResponse
+  | ResponseResponse
+  | ConnectResponse;
+
+interface CallResponse {
+  type: "call";
+  id: string;
+  error: string | null;
+  message: unknown;
+}
+
+interface RetrieveResponse {
+  type: "retrieve";
+  id: string;
+  error: string | null;
+  message: unknown;
+}
+
+interface ResponseResponse {
+  id: string;
+  type: "response";
+  error: string | null;
+  message: unknown;
+}
+
+interface ConnectResponse {
+  id: string;
+  type: "connect";
   error: string | null;
   message: string;
 }
@@ -73,6 +101,17 @@ interface ServerResponse {
 class Server extends EventTarget {
   ws!: WebSocket;
   key!: CryptoKey;
+  plugins: Map<
+    string,
+    {
+      client: WebSocketClient;
+      functions: Record<
+        string,
+        (...args: unknown[]) => Promise<unknown> | unknown
+      >;
+    }
+  > = new Map();
+  resolvers = new Map<string, (message: string) => unknown>();
 
   constructor(public port: number) {
     super();
@@ -88,97 +127,186 @@ class Server extends EventTarget {
   handleMessage(data: string, client: WebSocketClient) {
     const message: ServerMessage = JSON.parse(data);
 
-    verify(message.token, this.key)
-      .then(async (payload) => {
-        const result = await this.handleAction(
-          payload.name as string,
-          message.action
+    switch (message.action.type) {
+      case "call":
+        this.callAction(message.token, message.action).then((response) => {
+          this.send(response, client);
+        });
+        break;
+      case "retrieve":
+        this.retrieveAction(message.token, message.action).then((response) =>
+          this.send(response, client)
         );
-
-        this.send({ ...result, id: message.action.id }, client);
-      })
-      .catch((error) => {
+        break;
+      case "connect":
+        this.connectAction(message.action, client).then((response) =>
+          this.send(response, client)
+        );
+        break;
+      case "response":
+        this.responseAction(message.token, message.action);
+        break;
+      default:
         this.send(
-          {
-            error: "unauthorized",
-            message: String(error),
-            id: message.action.id,
-          },
+          this.createErrorResponse(message.action, "unknown action"),
           client
         );
+        break;
+    }
+  }
+
+  async authenticate(token: string): Promise<TokenPayload> {
+    try {
+      const payload = await verify(token, this.key);
+      return {
+        name: payload.name as string,
+        version: payload.version as string,
+        error: false,
+      };
+    } catch (_error) {
+      return { name: "", version: "", error: true };
+    }
+  }
+
+  async responseAction(token: string, action: ResponseAction) {
+    const { error } = await this.authenticate(token);
+
+    if (error) {
+      return;
+    }
+
+    const resolver = this.resolvers.get(action.id);
+    console.log(resolver, this.resolvers);
+
+    if (!resolver) {
+      return;
+    }
+
+    try {
+      if (action.error) {
+        console.log(error)
+      }else {
+        resolver(action.message);
+      }
+    } catch (_error) {
+      console.log(error);
+    }
+  }
+
+  async callAction(token: string, action: CallAction): Promise<ServerResponse> {
+    const { error, name } = await this.authenticate(token);
+
+    if (error) {
+      return this.createErrorResponse(action, "unauthenticated");
+    }
+
+    const plugin = this.plugins.get(name);
+
+    if (!plugin) {
+      return this.createErrorResponse(action, `package '${name}' not found`);
+    }
+
+    const func = plugin.functions[action.name];
+
+    if (!func) {
+      return this.createErrorResponse(
+        action,
+        `function '${action.name}' not found in plugin '${name}'`
+      );
+    }
+
+    try {
+      const result = await func.call(globalThis, action.arguments);
+      return this.createHealthyResponse(action, result || null);
+    } catch (error) {
+      return this.createErrorResponse(action, String(error));
+    }
+  }
+
+  async retrieveAction(
+    token: string,
+    action: RetrieveAction
+  ): Promise<ServerResponse> {
+    const { error, name } = await this.authenticate(token);
+
+    if (error) {
+      return this.createErrorResponse(action, "unauthenticated");
+    }
+
+    const plugin = this.plugins.get(name);
+
+    if (!plugin) {
+      return this.createErrorResponse(action, `package '${name}' not found`);
+    }
+
+    const constant = plugin.functions[action.name];
+
+    if (!constant) {
+      return this.createErrorResponse(
+        action,
+        `constant '${action.name}' not found in plugin '${name}'`
+      );
+    }
+
+    try {
+      return this.createHealthyResponse(action, constant);
+    } catch (error) {
+      return this.createErrorResponse(action, String(error));
+    }
+  }
+
+  async connectAction(
+    action: ConnectAction,
+    client: WebSocketClient
+  ): Promise<ServerResponse> {
+    try {
+      const manifest = JSON.parse(
+        await Deno.readTextFile(join(rootPath, action.name, "package.json"))
+      );
+
+      const { backend } = manifest.kasif;
+
+      const scriptPath = join(
+        rootPath,
+        action.name,
+        backend.dir,
+        `${backend.entry}.ts`
+      );
+
+      // @ts-expect-error global
+      globalThis[manifest.kasif.identifier] = {
+        remote: {
+          functions: new Proxy(
+            {},
+            {
+              get: (_, key) => {
+                return (...args: unknown[]) =>
+                  new Promise((resolver) => {
+                    const id = crypto.randomUUID();
+                    this.resolvers.set(id, resolver);
+                    this.send(
+                      { type: "response", name: key, id, arguments: args },
+                      client
+                    );
+                  });
+              },
+            }
+          ),
+        },
+      };
+
+      const mod = await import(scriptPath);
+      this.plugins.set(manifest.kasif.identifier, { client, functions: mod });
+
+      const token = await this.generateToken({
+        name: manifest.kasif.identifier,
+        version: "0.0.1",
       });
-  }
 
-  async handleAction(
-    name: string,
-    action: ServerAction
-  ): Promise<ServerResponse> {
-    switch (action.type) {
-      case "call":
-        return await this.callAction(name, action);
-      case "retrieve":
-        return this.retrieveAction(name, action);
+      return this.createHealthyResponse(action, token);
+    } catch (error) {
+      return this.createErrorResponse(action, String(error));
     }
-  }
-
-  async callAction(
-    name: string,
-    action: ServerCallAction
-  ): Promise<ServerResponse> {
-    const p = packages.get(name);
-
-    if (p) {
-      if (p[action.name]) {
-        try {
-          const result = await p[action.name].call(
-            globalThis,
-            action.arguments
-          );
-          return {
-            error: null,
-            message: result,
-          };
-        } catch (error) {
-          return {
-            error: String(error),
-            message: "runtime error",
-          };
-        }
-      } else {
-        return {
-          error: `no function named ${action.name} in ${name}`,
-          message: `no function named ${action.name} in ${name}`,
-        };
-      }
-    }
-
-    return {
-      error: `no package named ${name}`,
-      message: `no package named ${name}`,
-    };
-  }
-
-  retrieveAction(name: string, action: ServerRetrieveAction): ServerResponse {
-    const p = packages.get(name);
-
-    if (p) {
-      if (p[action.name]) {
-        return {
-          error: null,
-          message: p[action.name] as unknown as string,
-        };
-      } else {
-        return {
-          error: `no constant named ${action.name} in ${name}`,
-          message: `no constant named ${action.name} in ${name}`,
-        };
-      }
-    }
-
-    return {
-      error: `no package named ${name}`,
-      message: `no package named ${name}`,
-    };
   }
 
   send<T>(message: T, client: WebSocketClient) {
@@ -191,6 +319,27 @@ class Server extends EventTarget {
     return jwt;
   }
 
+  createHealthyResponse(
+    action: ServerAction,
+    message: unknown
+  ): ServerResponse {
+    return {
+      id: action.id,
+      error: null,
+      message,
+      type: action.type,
+    } as ServerResponse;
+  }
+
+  createErrorResponse(action: ServerAction, error: string): ServerResponse {
+    return {
+      id: action.id,
+      error: error,
+      message: error,
+      type: action.type,
+    };
+  }
+
   serve() {
     const wss = new WebSocketServer(this.port);
     wss.on("connection", (client: WebSocketClient) => {
@@ -200,19 +349,13 @@ class Server extends EventTarget {
     });
   }
 }
+
 const server = new Server(port);
 
-server.addEventListener("ready", async () => {
-  const tokens: Record<string, string> = {};
-  for await (const entry of packages.entries()) {
-    tokens[entry[0]] = await server.generateToken({
-      name: entry[0],
-      version: "0.0.1",
-    });
-  }
-  const encoder = new TextEncoder();
-  const content = encoder.encode(JSON.stringify({ tokens, port }));
-  await Deno.writeFile(join(rootPath, "remote", "stdout.json"), content);
-
+server.addEventListener("ready", () => {
+  Deno.writeTextFileSync(
+    join(getModuleDir(import.meta), "stdout.json"),
+    JSON.stringify({ port })
+  );
   server.serve();
 });
